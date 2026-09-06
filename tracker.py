@@ -125,11 +125,26 @@ def price_lines(current: float, record: dict[str, Any]) -> str:
     )
 
 
-def send_telegram(text: str) -> None:
+def telegram_token() -> str:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token or token.startswith("123456"):
+        raise RuntimeError("Заполните TELEGRAM_BOT_TOKEN в .env")
+    return token
+
+
+def telegram_chat_id() -> str:
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-    if not token or not chat_id or token.startswith("123456"):
-        log.info("Telegram не настроен — сообщение только в лог:\n%s", text)
+    if not chat_id:
+        raise RuntimeError("Заполните TELEGRAM_CHAT_ID в .env")
+    return chat_id
+
+
+def send_telegram(text: str, chat_id: str | None = None) -> None:
+    try:
+        token = telegram_token()
+        chat_id = chat_id or telegram_chat_id()
+    except RuntimeError as exc:
+        log.info("%s — сообщение только в лог:\n%s", exc, text)
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     response = requests.post(
@@ -150,7 +165,7 @@ def is_placeholder(nm: int | None) -> bool:
     return nm is None or nm == 0
 
 
-def check_once() -> None:
+def snapshot_products() -> list[dict[str, Any]]:
     config = load_config()
     dest = int(config.get("dest") or -1257786)
     products = config.get("products") or []
@@ -159,6 +174,7 @@ def check_once() -> None:
 
     state = load_state()
     log.info("Проверка %s товар(ов)", len(products))
+    rows: list[dict[str, Any]] = []
 
     for item in products:
         source = str(item.get("url") or item.get("nm") or "").strip()
@@ -172,6 +188,7 @@ def check_once() -> None:
             info = fetch_product(nm, dest)
         except Exception as exc:
             log.warning("%s: %s", label, exc)
+            rows.append({"label": label, "error": str(exc)})
             continue
 
         new_price = float(info["price"])
@@ -190,9 +207,30 @@ def check_once() -> None:
             record["last"] = new_price
 
         old_price = None if old is None else float(old["last"])
-        safe_label = html.escape(label)
-        stats = price_lines(new_price, record)
+        rows.append(
+            {
+                "label": label,
+                "url": info["url"],
+                "price": new_price,
+                "old_price": old_price,
+                "record": record,
+            }
+        )
+        state[key] = record
 
+    save_state(state)
+    return rows
+
+
+def notify_price_changes(rows: list[dict[str, Any]]) -> None:
+    for row in rows:
+        if row.get("error"):
+            continue
+        label = row["label"]
+        new_price = float(row["price"])
+        old_price = row["old_price"]
+        safe_label = html.escape(label)
+        stats = price_lines(new_price, row["record"])
         if old_price is None:
             log.info("[new] %s — %.2f ₽ (без уведомления)", label, new_price)
         elif new_price < old_price:
@@ -201,20 +239,105 @@ def check_once() -> None:
             send_telegram(
                 f"📉 Цена снизилась\n<b>{safe_label}</b>\n"
                 f"{old_price:.2f} ₽ → <b>{new_price:.2f} ₽</b>\n"
-                f"Экономия: {saved:.2f} ₽\n{stats}\n{info['url']}"
+                f"Экономия: {saved:.2f} ₽\n{stats}\n{row['url']}"
             )
         elif new_price > old_price:
             log.info("[up] %s — %.2f → %.2f", label, old_price, new_price)
             send_telegram(
                 f"📈 Цена выросла\n<b>{safe_label}</b>\n"
-                f"{old_price:.2f} ₽ → <b>{new_price:.2f} ₽</b>\n{stats}\n{info['url']}"
+                f"{old_price:.2f} ₽ → <b>{new_price:.2f} ₽</b>\n{stats}\n{row['url']}"
             )
         else:
             log.info("[same] %s — %.2f ₽", label, new_price)
 
-        state[key] = record
 
-    save_state(state)
+def format_prices_report(rows: list[dict[str, Any]]) -> str:
+    parts = ["📌 Текущие цены"]
+    for row in rows:
+        label = html.escape(str(row["label"]))
+        if row.get("error"):
+            parts.append(f"\n<b>{label}</b>\nошибка: {html.escape(row['error'])}")
+            continue
+        parts.append(
+            f"\n<b>{label}</b>\n{price_lines(float(row['price']), row['record'])}\n{row['url']}"
+        )
+    return "\n".join(parts)
+
+
+def check_once() -> None:
+    notify_price_changes(snapshot_products())
+
+
+PRICE_COMMANDS = {"/prices", "/price", "/цены", "цены", "/start"}
+
+
+def is_price_command(text: str) -> bool:
+    raw = text.strip().lower()
+    if not raw:
+        return False
+    cmd = raw.split()[0]
+    cmd = cmd.split("@", 1)[0]
+    return cmd in PRICE_COMMANDS or raw in PRICE_COMMANDS
+
+
+def run_bot() -> None:
+    token = telegram_token()
+    allowed = telegram_chat_id()
+    requests.post(
+        f"https://api.telegram.org/bot{token}/deleteWebhook",
+        data={"drop_pending_updates": False},
+        timeout=30,
+    )
+    requests.post(
+        f"https://api.telegram.org/bot{token}/setMyCommands",
+        json={"commands": [{"command": "prices", "description": "Текущие цены"}]},
+        timeout=30,
+    )
+    log.info("Бот слушает команды /prices и «цены»")
+    offset = None
+    minutes = int(load_config().get("check_interval_minutes") or 30)
+    next_check = time.time()
+    while True:
+        if time.time() >= next_check:
+            try:
+                check_once()
+            except Exception as exc:
+                log.error("%s", exc)
+            next_check = time.time() + minutes * 60
+        params: dict[str, Any] = {"timeout": 25}
+        if offset is not None:
+            params["offset"] = offset
+        try:
+            response = requests.get(
+                f"https://api.telegram.org/bot{token}/getUpdates",
+                params=params,
+                timeout=40,
+            )
+            response.raise_for_status()
+            updates = response.json().get("result") or []
+        except requests.RequestException as exc:
+            log.warning("Telegram getUpdates: %s", exc)
+            time.sleep(3)
+            continue
+        for update in updates:
+            offset = int(update["update_id"]) + 1
+            message = update.get("message") or update.get("edited_message") or {}
+            chat = message.get("chat") or {}
+            if str(chat.get("id", "")) != allowed:
+                continue
+            text = str(message.get("text") or "")
+            if not is_price_command(text):
+                send_telegram(
+                    "Напишите /prices или «цены» — пришлю актуальные цены.",
+                    chat_id=allowed,
+                )
+                continue
+            try:
+                rows = snapshot_products()
+                send_telegram(format_prices_report(rows), chat_id=allowed)
+            except Exception as exc:
+                log.error("%s", exc)
+                send_telegram(f"Не удалось получить цены: {html.escape(str(exc))}", chat_id=allowed)
 
 
 def main() -> int:
@@ -223,6 +346,11 @@ def main() -> int:
         "--watch",
         action="store_true",
         help="Проверять по кругу, пока скрипт запущен",
+    )
+    parser.add_argument(
+        "--bot",
+        action="store_true",
+        help="Слушать Telegram: /prices или «цены», плюс проверка по расписанию",
     )
     args = parser.parse_args()
 
@@ -234,7 +362,9 @@ def main() -> int:
     )
 
     try:
-        if args.watch:
+        if args.bot:
+            run_bot()
+        elif args.watch:
             minutes = int(load_config().get("check_interval_minutes") or 30)
             while True:
                 check_once()
