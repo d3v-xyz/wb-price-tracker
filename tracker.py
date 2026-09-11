@@ -34,6 +34,18 @@ def load_config() -> dict[str, Any]:
     return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
 
 
+def save_config(config: dict[str, Any]) -> None:
+    payload = {
+        "dest": config.get("dest", -1257786),
+        "check_interval_minutes": config.get("check_interval_minutes", 30),
+        "products": list(config.get("products") or []),
+    }
+    CONFIG_PATH.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
 def parse_article(value: str) -> int | None:
     match = ARTICLE_RE.search(value.strip())
     if not match:
@@ -170,7 +182,8 @@ def snapshot_products() -> list[dict[str, Any]]:
     dest = int(config.get("dest") or -1257786)
     products = config.get("products") or []
     if not products:
-        raise ValueError("В config.json пустой список products")
+        log.info("Список товаров пуст")
+        return []
 
     state = load_state()
     log.info("Проверка %s товар(ов)", len(products))
@@ -268,16 +281,142 @@ def check_once() -> None:
     notify_price_changes(snapshot_products())
 
 
-PRICE_COMMANDS = {"/prices", "/price", "/цены", "цены", "/start"}
+HELP_TEXT = (
+    "Команды:\n"
+    "/prices — текущие цены\n"
+    "/list — список отслеживания\n"
+    "/add ссылка [название] — добавить товар WB\n"
+    "/del номер|артикул|ссылка — удалить товар\n\n"
+    "Можно просто прислать ссылку Wildberries — товар добавится."
+)
 
 
-def is_price_command(text: str) -> bool:
-    raw = text.strip().lower()
+def command_parts(text: str) -> tuple[str, str]:
+    raw = text.strip()
     if not raw:
-        return False
-    cmd = raw.split()[0]
-    cmd = cmd.split("@", 1)[0]
-    return cmd in PRICE_COMMANDS or raw in PRICE_COMMANDS
+        return "", ""
+    first, _, rest = raw.partition(" ")
+    cmd = first.split("@", 1)[0].lower()
+    return cmd, rest.strip()
+
+
+def product_nm(item: dict[str, Any]) -> int | None:
+    return parse_article(str(item.get("url") or item.get("nm") or ""))
+
+
+def find_product_index(products: list[Any], query: str) -> int | None:
+    query = query.strip()
+    if not query:
+        return None
+    if query.isdigit():
+        idx = int(query) - 1
+        if 0 <= idx < len(products):
+            return idx
+    nm = parse_article(query)
+    if nm:
+        for i, item in enumerate(products):
+            if product_nm(item) == nm:
+                return i
+    q = query.lower()
+    note_hits = [
+        i
+        for i, item in enumerate(products)
+        if str(item.get("note") or "").strip().lower() == q
+    ]
+    if len(note_hits) == 1:
+        return note_hits[0]
+    return None
+
+
+def format_list(products: list[Any]) -> str:
+    if not products:
+        return "Список пуст. Добавьте товар: /add ссылка"
+    lines = ["📋 Отслеживание"]
+    for i, item in enumerate(products, start=1):
+        note = html.escape(str(item.get("note") or "").strip() or "без названия")
+        url = html.escape(str(item.get("url") or ""))
+        nm = product_nm(item)
+        art = f" · {nm}" if nm else ""
+        lines.append(f"\n{i}. <b>{note}</b>{art}\n{url}")
+    return "\n".join(lines)
+
+
+def add_product(raw: str) -> str:
+    if not raw:
+        return "Так: /add https://www.wildberries.ru/catalog/123/detail.aspx название"
+    first, _, rest = raw.partition(" ")
+    nm = parse_article(first) or parse_article(raw)
+    if is_placeholder(nm):
+        return "Не вижу артикул Wildberries. Пришлите ссылку на карточку."
+    note = rest.strip()
+    url = PRODUCT_URL.format(nm=nm)
+    config = load_config()
+    products = list(config.get("products") or [])
+    for item in products:
+        if product_nm(item) == nm:
+            label = html.escape(str(item.get("note") or f"товар {nm}"))
+            return f"Уже в списке: <b>{label}</b>"
+    dest = int(config.get("dest") or -1257786)
+    info = fetch_product(nm, dest)
+    if not note:
+        brand = str(info.get("brand") or "").strip()
+        name = str(info.get("name") or f"товар {nm}").strip()
+        note = f"{brand} {name}".strip() if brand else name
+    products.append({"url": url, "note": note})
+    config["products"] = products
+    save_config(config)
+    checked_at = now_iso()
+    price = float(info["price"])
+    state = load_state()
+    state[str(nm)] = {"last": price, "min": price, "min_at": checked_at}
+    save_state(state)
+    record = state[str(nm)]
+    return (
+        f"➕ Добавил\n<b>{html.escape(note)}</b>\n"
+        f"{price_lines(price, record)}\n{url}"
+    )
+
+
+def delete_product(raw: str) -> str:
+    config = load_config()
+    products = list(config.get("products") or [])
+    if not products:
+        return "Список и так пуст."
+    if not raw:
+        return format_list(products) + "\n\nУдалить: /del 1"
+    idx = find_product_index(products, raw)
+    if idx is None:
+        return "Не нашёл товар. Удаляйте по номеру из /list, артикулу или ссылке."
+    removed = products.pop(idx)
+    config["products"] = products
+    save_config(config)
+    nm = product_nm(removed)
+    if nm:
+        state = load_state()
+        state.pop(str(nm), None)
+        save_state(state)
+    label = html.escape(str(removed.get("note") or f"товар {nm}"))
+    return f"🗑 Удалил <b>{label}</b>"
+
+
+def handle_bot_text(text: str) -> str:
+    cmd, rest = command_parts(text)
+    if cmd in {"/prices", "/price", "/цены"} or text.strip().lower() == "цены":
+        rows = snapshot_products()
+        if not rows:
+            return "Список пуст. Добавьте товар: /add ссылка"
+        return format_prices_report(rows)
+    if cmd in {"/list", "/список"}:
+        return format_list(load_config().get("products") or [])
+    if cmd in {"/add", "/добавить"}:
+        return add_product(rest)
+    if cmd in {"/del", "/delete", "/remove", "/удалить"}:
+        return delete_product(rest)
+    if cmd in {"/start", "/help", "/помощь"}:
+        return HELP_TEXT
+    if parse_article(text):
+        return add_product(text)
+    return HELP_TEXT
 
 
 def run_bot() -> None:
@@ -290,10 +429,18 @@ def run_bot() -> None:
     )
     requests.post(
         f"https://api.telegram.org/bot{token}/setMyCommands",
-        json={"commands": [{"command": "prices", "description": "Текущие цены"}]},
+        json={
+            "commands": [
+                {"command": "prices", "description": "Текущие цены"},
+                {"command": "list", "description": "Список товаров"},
+                {"command": "add", "description": "Добавить товар WB"},
+                {"command": "del", "description": "Удалить товар"},
+                {"command": "help", "description": "Команды"},
+            ]
+        },
         timeout=30,
     )
-    log.info("Бот слушает команды /prices и «цены»")
+    log.info("Бот слушает /prices, /add, /del, /list")
     offset = None
     minutes = int(load_config().get("check_interval_minutes") or 30)
     next_check = time.time()
@@ -326,18 +473,13 @@ def run_bot() -> None:
             if str(chat.get("id", "")) != allowed:
                 continue
             text = str(message.get("text") or "")
-            if not is_price_command(text):
-                send_telegram(
-                    "Напишите /prices или «цены» — пришлю актуальные цены.",
-                    chat_id=allowed,
-                )
+            if not text.strip():
                 continue
             try:
-                rows = snapshot_products()
-                send_telegram(format_prices_report(rows), chat_id=allowed)
+                send_telegram(handle_bot_text(text), chat_id=allowed)
             except Exception as exc:
                 log.error("%s", exc)
-                send_telegram(f"Не удалось получить цены: {html.escape(str(exc))}", chat_id=allowed)
+                send_telegram(f"Ошибка: {html.escape(str(exc))}", chat_id=allowed)
 
 
 def main() -> int:
@@ -350,7 +492,7 @@ def main() -> int:
     parser.add_argument(
         "--bot",
         action="store_true",
-        help="Слушать Telegram: /prices или «цены», плюс проверка по расписанию",
+        help="Слушать Telegram: цены, добавление и удаление товаров",
     )
     args = parser.parse_args()
 
