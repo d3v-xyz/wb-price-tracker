@@ -115,11 +115,31 @@ def normalize_record(value: Any) -> dict[str, Any]:
     return {"last": last, "min": last, "min_at": None}
 
 
+def default_owner() -> str:
+    return os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+
+def item_owner(item: dict[str, Any]) -> str:
+    return str(item.get("owner_chat_id") or default_owner()).strip()
+
+
+def state_key(nm: int, owner: str) -> str:
+    return f"{nm}:{owner}" if owner else str(nm)
+
+
 def load_state() -> dict[str, dict[str, Any]]:
     if not STATE_PATH.exists():
         return {}
     raw = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-    return {str(k): normalize_record(v) for k, v in raw.items()}
+    owner = default_owner()
+    out: dict[str, dict[str, Any]] = {}
+    for k, v in raw.items():
+        rec = normalize_record(v)
+        key = str(k)
+        if ":" not in key and key.isdigit() and owner:
+            key = state_key(int(key), owner)
+        out[key] = rec
+    return out
 
 
 def save_state(state: dict[str, dict[str, Any]]) -> None:
@@ -177,10 +197,12 @@ def is_placeholder(nm: int | None) -> bool:
     return nm is None or nm == 0
 
 
-def snapshot_products() -> list[dict[str, Any]]:
+def snapshot_products(owner_chat_id: str | None = None) -> list[dict[str, Any]]:
     config = load_config()
     dest = int(config.get("dest") or -1257786)
-    products = config.get("products") or []
+    products = list(config.get("products") or [])
+    if owner_chat_id:
+        products = [item for item in products if item_owner(item) == str(owner_chat_id)]
     if not products:
         log.info("Список товаров пуст")
         return []
@@ -201,12 +223,15 @@ def snapshot_products() -> list[dict[str, Any]]:
             info = fetch_product(nm, dest)
         except Exception as exc:
             log.warning("%s: %s", label, exc)
-            rows.append({"label": label, "error": str(exc)})
+            rows.append({"label": label, "error": str(exc), "owner_chat_id": item_owner(item)})
             continue
 
         new_price = float(info["price"])
-        key = str(nm)
+        owner = item_owner(item)
+        key = state_key(nm, owner)
         old = state.get(key)
+        if old is None and owner:
+            old = state.get(str(nm))
         checked_at = now_iso()
         if old is None:
             record = {"last": new_price, "min": new_price, "min_at": checked_at}
@@ -227,6 +252,7 @@ def snapshot_products() -> list[dict[str, Any]]:
                 "price": new_price,
                 "old_price": old_price,
                 "record": record,
+                "owner_chat_id": owner,
             }
         )
         state[key] = record
@@ -244,21 +270,27 @@ def notify_price_changes(rows: list[dict[str, Any]]) -> None:
         old_price = row["old_price"]
         safe_label = html.escape(label)
         stats = price_lines(new_price, row["record"])
+        owner = str(row.get("owner_chat_id") or "").strip()
+        if not owner:
+            log.info("[skip notify] %s — нет владельца", label)
+            continue
         if old_price is None:
             log.info("[new] %s — %.2f ₽ (без уведомления)", label, new_price)
         elif new_price < old_price:
             saved = old_price - new_price
-            log.info("[drop] %s — %.2f → %.2f", label, old_price, new_price)
+            log.info("[drop] %s — %.2f → %.2f → %s", label, old_price, new_price, owner)
             send_telegram(
                 f"📉 Цена снизилась\n<b>{safe_label}</b>\n"
                 f"{old_price:.2f} ₽ → <b>{new_price:.2f} ₽</b>\n"
-                f"Экономия: {saved:.2f} ₽\n{stats}\n{row['url']}"
+                f"Экономия: {saved:.2f} ₽\n{stats}\n{row['url']}",
+                chat_id=owner,
             )
         elif new_price > old_price:
-            log.info("[up] %s — %.2f → %.2f", label, old_price, new_price)
+            log.info("[up] %s — %.2f → %.2f → %s", label, old_price, new_price, owner)
             send_telegram(
                 f"📈 Цена выросла\n<b>{safe_label}</b>\n"
-                f"{old_price:.2f} ₽ → <b>{new_price:.2f} ₽</b>\n{stats}\n{row['url']}"
+                f"{old_price:.2f} ₽ → <b>{new_price:.2f} ₽</b>\n{stats}\n{row['url']}",
+                chat_id=owner,
             )
         else:
             log.info("[same] %s — %.2f ₽", label, new_price)
@@ -304,23 +336,29 @@ def product_nm(item: dict[str, Any]) -> int | None:
     return parse_article(str(item.get("url") or item.get("nm") or ""))
 
 
-def find_product_index(products: list[Any], query: str) -> int | None:
+def owned_products(products: list[Any], chat_id: str) -> list[tuple[int, Any]]:
+    chat_id = str(chat_id)
+    return [(i, item) for i, item in enumerate(products) if item_owner(item) == chat_id]
+
+
+def find_owned_index(products: list[Any], query: str, chat_id: str) -> int | None:
+    owned = owned_products(products, chat_id)
     query = query.strip()
-    if not query:
+    if not query or not owned:
         return None
     if query.isdigit():
         idx = int(query) - 1
-        if 0 <= idx < len(products):
-            return idx
+        if 0 <= idx < len(owned):
+            return owned[idx][0]
     nm = parse_article(query)
     if nm:
-        for i, item in enumerate(products):
+        for global_i, item in owned:
             if product_nm(item) == nm:
-                return i
+                return global_i
     q = query.lower()
     note_hits = [
-        i
-        for i, item in enumerate(products)
+        global_i
+        for global_i, item in owned
         if str(item.get("note") or "").strip().lower() == q
     ]
     if len(note_hits) == 1:
@@ -328,11 +366,12 @@ def find_product_index(products: list[Any], query: str) -> int | None:
     return None
 
 
-def format_list(products: list[Any]) -> str:
-    if not products:
-        return "Список пуст. Добавьте товар: /add ссылка"
-    lines = ["📋 Отслеживание"]
-    for i, item in enumerate(products, start=1):
+def format_list(products: list[Any], chat_id: str) -> str:
+    owned = owned_products(products, chat_id)
+    if not owned:
+        return "У вас пока нет товаров. Добавьте: /add ссылка"
+    lines = ["📋 Ваши товары"]
+    for i, (_g, item) in enumerate(owned, start=1):
         note = html.escape(str(item.get("note") or "").strip() or "без названия")
         url = html.escape(str(item.get("url") or ""))
         nm = product_nm(item)
@@ -341,7 +380,7 @@ def format_list(products: list[Any]) -> str:
     return "\n".join(lines)
 
 
-def add_product(raw: str) -> str:
+def add_product(raw: str, chat_id: str) -> str:
     if not raw:
         return "Так: /add https://www.wildberries.ru/catalog/123/detail.aspx название"
     first, _, rest = raw.partition(" ")
@@ -353,75 +392,76 @@ def add_product(raw: str) -> str:
     config = load_config()
     products = list(config.get("products") or [])
     for item in products:
-        if product_nm(item) == nm:
+        if product_nm(item) == nm and item_owner(item) == str(chat_id):
             label = html.escape(str(item.get("note") or f"товар {nm}"))
-            return f"Уже в списке: <b>{label}</b>"
+            return f"Уже в вашем списке: <b>{label}</b>"
     dest = int(config.get("dest") or -1257786)
     info = fetch_product(nm, dest)
     if not note:
         brand = str(info.get("brand") or "").strip()
         name = str(info.get("name") or f"товар {nm}").strip()
         note = f"{brand} {name}".strip() if brand else name
-    products.append({"url": url, "note": note})
+    products.append({"url": url, "note": note, "owner_chat_id": str(chat_id)})
     config["products"] = products
     save_config(config)
     checked_at = now_iso()
     price = float(info["price"])
     state = load_state()
-    state[str(nm)] = {"last": price, "min": price, "min_at": checked_at}
+    key = state_key(nm, str(chat_id))
+    state[key] = {"last": price, "min": price, "min_at": checked_at}
     save_state(state)
-    record = state[str(nm)]
+    record = state[key]
     return (
-        f"➕ Добавил\n<b>{html.escape(note)}</b>\n"
+        f"➕ Добавил, уведомления придут вам\n<b>{html.escape(note)}</b>\n"
         f"{price_lines(price, record)}\n{url}"
     )
 
 
-def delete_product(raw: str) -> str:
+def delete_product(raw: str, chat_id: str) -> str:
     config = load_config()
     products = list(config.get("products") or [])
-    if not products:
-        return "Список и так пуст."
+    owned = owned_products(products, chat_id)
+    if not owned:
+        return "У вас нет товаров для удаления."
     if not raw:
-        return format_list(products) + "\n\nУдалить: /del 1"
-    idx = find_product_index(products, raw)
+        return format_list(products, chat_id) + "\n\nУдалить: /del 1"
+    idx = find_owned_index(products, raw, chat_id)
     if idx is None:
-        return "Не нашёл товар. Удаляйте по номеру из /list, артикулу или ссылке."
+        return "Не нашёл ваш товар. Смотрите номера в /list."
     removed = products.pop(idx)
     config["products"] = products
     save_config(config)
     nm = product_nm(removed)
     if nm:
         state = load_state()
-        state.pop(str(nm), None)
+        state.pop(state_key(nm, str(chat_id)), None)
         save_state(state)
     label = html.escape(str(removed.get("note") or f"товар {nm}"))
     return f"🗑 Удалил <b>{label}</b>"
 
 
-def handle_bot_text(text: str) -> str:
+def handle_bot_text(text: str, chat_id: str) -> str:
     cmd, rest = command_parts(text)
     if cmd in {"/prices", "/price", "/цены"} or text.strip().lower() == "цены":
-        rows = snapshot_products()
+        rows = snapshot_products(chat_id)
         if not rows:
-            return "Список пуст. Добавьте товар: /add ссылка"
+            return "У вас пока нет товаров. Добавьте: /add ссылка"
         return format_prices_report(rows)
     if cmd in {"/list", "/список"}:
-        return format_list(load_config().get("products") or [])
+        return format_list(load_config().get("products") or [], chat_id)
     if cmd in {"/add", "/добавить"}:
-        return add_product(rest)
+        return add_product(rest, chat_id)
     if cmd in {"/del", "/delete", "/remove", "/удалить"}:
-        return delete_product(rest)
+        return delete_product(rest, chat_id)
     if cmd in {"/start", "/help", "/помощь"}:
         return HELP_TEXT
     if parse_article(text):
-        return add_product(text)
+        return add_product(text, chat_id)
     return HELP_TEXT
 
 
 def run_bot() -> None:
     token = telegram_token()
-    allowed = telegram_chat_id()
     requests.post(
         f"https://api.telegram.org/bot{token}/deleteWebhook",
         data={"drop_pending_updates": False},
@@ -469,17 +509,17 @@ def run_bot() -> None:
         for update in updates:
             offset = int(update["update_id"]) + 1
             message = update.get("message") or update.get("edited_message") or {}
-            chat = message.get("chat") or {}
-            if str(chat.get("id", "")) != allowed:
+            chat_id = str((message.get("chat") or {}).get("id") or "")
+            if not chat_id:
                 continue
             text = str(message.get("text") or "")
             if not text.strip():
                 continue
             try:
-                send_telegram(handle_bot_text(text), chat_id=allowed)
+                send_telegram(handle_bot_text(text, chat_id), chat_id=chat_id)
             except Exception as exc:
                 log.error("%s", exc)
-                send_telegram(f"Ошибка: {html.escape(str(exc))}", chat_id=allowed)
+                send_telegram(f"Ошибка: {html.escape(str(exc))}", chat_id=chat_id)
 
 
 def main() -> int:
