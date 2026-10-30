@@ -89,6 +89,47 @@ def fetch_product(nm: int, dest: int) -> dict[str, Any]:
     }
 
 
+def check_wb_accessibility(dest: int) -> bool:
+    """Проверяет, доступен ли Wildberries с текущего IP при запуске.
+
+    WB (сервис wbaas) отдаёт 403 с пустым телом для зарубежных и
+    датацентровых IP (VPS/хостинг). Проверка при старте помогает сразу
+    понять причину, а не ловить 403 на каждой команде /add.
+    """
+    probe_nm = 494864541  # любой публичный товар для проверки связи
+    try:
+        response = wb_http.get(
+            WB_URL,
+            params={
+                "appType": 1,
+                "curr": "rub",
+                "dest": dest,
+                "spp": 30,
+                "nm": probe_nm,
+            },
+            impersonate="chrome",
+            timeout=20,
+        )
+    except Exception as exc:  # сеть, TLS, таймаут
+        log.error("WB недоступен с этого IP: %s", exc)
+        return False
+
+    if response.status_code == 200:
+        log.info("WB доступен с этого IP")
+        return True
+
+    if response.status_code == 403:
+        log.error(
+            "WB вернул 403 (сервис wbaas). Обычно это блок по IP: "
+            "зарубежный или датацентровый адрес (VPS/хостинг). "
+            "Проверьте IP: curl -s https://ipinfo.io/json. "
+            "Решение — российский резидентный прокси или российский IP."
+        )
+        return False
+
+    log.error("WB вернул неожиданный статус: HTTP %s", response.status_code)
+    return False
+
 def now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="minutes")
 
@@ -534,6 +575,11 @@ def main() -> int:
         action="store_true",
         help="Слушать Telegram: цены, добавление и удаление товаров",
     )
+    parser.add_argument(
+        "--skip-wb-check",
+        action="store_true",
+        help="Не проверять доступность WB с этого IP при старте",
+    )
     args = parser.parse_args()
 
     load_dotenv(ROOT / ".env")
@@ -544,6 +590,15 @@ def main() -> int:
     )
 
     try:
+        if not args.skip_wb_check:
+            dest = int(load_config().get("dest") or -1257786)
+            if not check_wb_accessibility(dest):
+                log.warning(
+                    "WB недоступен с этого IP — /add и проверка цен будут "
+                    "падать с 403. Запуск продолжаю; отключить проверку: "
+                    "--skip-wb-check"
+                )
+
         if args.bot:
             run_bot()
         elif args.watch:
